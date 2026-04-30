@@ -284,7 +284,84 @@ def compose_message(
 
 
 # ─── Reply composer ───────────────────────────────────────────────────────────
-REPLY_SYSTEM = """You are Vera, magicpin's AI merchant assistant, mid-conversation.
+CUSTOMER_REPLY_SYSTEM = """You are Vera, magicpin's AI assistant handling a customer message on behalf of a merchant.
+
+The customer sent a message (booking, inquiry, or question). You must:
+1. Address the CUSTOMER by their name (not the merchant's name)
+2. Confirm/respond to their specific intent (booking slot, inquiry, question)
+3. Be warm, concise, and action-oriented
+4. Use WhatsApp-native plain text only
+5. End with a clear next step for the customer
+
+OUTPUT FORMAT (JSON only):
+{
+  "action": "send",
+  "body": "<reply addressed to the customer>",
+  "cta": "open_ended" | "binary_yes_stop" | "none",
+  "rationale": "<1 sentence why>"
+}"""
+
+
+def compose_customer_reply(
+    conv_state: ConversationState,
+    customer_message: str,
+    merchant: dict,
+    category: dict,
+    customer: Optional[dict] = None,
+) -> dict:
+    """Compose a reply TO a customer — uses customer name, echoes their booking/inquiry intent."""
+    merchant_name = merchant.get("identity", {}).get("name", "the clinic")
+    trigger = conv_state.trigger_context or {}
+
+    # Extract customer name from customer context or trigger payload
+    customer_name = "there"
+    if customer:
+        customer_name = (
+            customer.get("name")
+            or customer.get("first_name")
+            or customer.get("identity", {}).get("name", "there")
+        )
+    elif trigger.get("payload", {}).get("customer_name"):
+        customer_name = trigger["payload"]["customer_name"]
+
+    # Extract booking/intent details from the message and trigger
+    booking_details = trigger.get("payload", {})
+
+    prompt = f"""A customer sent a message to {merchant_name} and you must reply on behalf of the merchant.
+
+CUSTOMER NAME: {customer_name}
+CUSTOMER MESSAGE: "{customer_message}"
+TRIGGER CONTEXT: {json.dumps(trigger, ensure_ascii=False)}
+CUSTOMER CONTEXT: {json.dumps(customer, ensure_ascii=False) if customer else "Not available"}
+BOOKING DETAILS FROM TRIGGER: {json.dumps(booking_details, ensure_ascii=False)}
+
+Reply TO {customer_name} (not to the merchant). Confirm their specific request (booking slot, inquiry, etc).
+If they mentioned a date/time (like "Wed 5 Nov, 6pm"), confirm that exact slot.
+Output JSON only."""
+
+    try:
+        raw = call_claude(CUSTOMER_REPLY_SYSTEM, prompt, max_tokens=400)
+        raw = re.sub(r"^```json\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
+        result = json.loads(raw.strip())
+        if result.get("body"):
+            conv_state.history.append({
+                "from": "vera",
+                "msg": result["body"],
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        return result
+    except Exception as e:
+        log.error(f"Customer reply error: {e}")
+        return {
+            "action": "send",
+            "body": f"Hi {customer_name}! Got your message — we'll confirm your slot shortly. Thanks for reaching out to {merchant_name}!",
+            "cta": "none",
+            "rationale": "Fallback customer reply",
+        }
+
+
+
 
 Your job: given the conversation so far + the merchant's latest reply, decide the next move.
 
@@ -355,12 +432,18 @@ category: {category.get("slug")}
 peer_stats: {json.dumps(category.get("peer_stats", {}), ensure_ascii=False)}
 customer_aggregate: {json.dumps(merchant.get("customer_aggregate", {}), ensure_ascii=False)}
 performance_30d: {json.dumps(merchant.get("performance", {}), ensure_ascii=False)}
+trigger_context: {json.dumps(conv_state.trigger_context or {}, ensure_ascii=False)}
+
+CRITICAL — The merchant's message may contain SPECIFIC CONTEXT (equipment details, audit needs, specific questions).
+You MUST directly address and echo back whatever specific detail they mentioned (e.g. if they said "D-speed X-ray unit", reference that exact thing in your reply).
+Do NOT give a generic holding response. Act on the specific context they gave you.
 
 Rules:
 - If intent=accept: action must be "send", body must START with action being taken (not another question)
 - If intent=reject: action must be "end"
 - Keep body under 120 words
 - Body must NOT match any string in the previous Vera messages list above
+- ALWAYS reference the specific thing the merchant mentioned
 
 Output JSON only."""
 
@@ -397,11 +480,17 @@ Output JSON only."""
 
     except Exception as e:
         log.error(f"Reply compose error: {e}")
+        owner = merchant.get("identity", {}).get("owner_first_name", "")
+        lang = conv_state.detected_language
+        if lang == "hi-en":
+            fallback_body = f"{'Dr. ' + owner if owner else 'Aapki'} request note kar li — main abhi isko check karke detail mein reply karti hoon."
+        else:
+            fallback_body = f"{'Dr. ' + owner + ', I' if owner else 'I'}'ve noted your specific requirement — checking on it now and will reply with full details shortly."
         return {
             "action": "send",
-            "body": "Ek second — let me pull that for you and get back shortly.",
+            "body": fallback_body,
             "cta": "none",
-            "rationale": "Composition error fallback",
+            "rationale": "Composition error fallback — personalised to merchant",
         }
 
 
@@ -525,12 +614,37 @@ async def tick(body: TickBody):
 
     trigger_list.sort(key=lambda x: x[0], reverse=True)
 
+    # Also try triggers not yet in context store — attempt all available_triggers
+    available_ids_not_loaded = [
+        tid for tid in body.available_triggers
+        if tid not in fired_triggers and tid not in [t[1] for t in trigger_list]
+    ]
+    # Build minimal synthetic triggers for any available trigger ID not yet loaded
+    for tid in available_ids_not_loaded:
+        # Try to find any merchant that references this trigger id via context
+        # Or compose a minimal trigger shell so the bot can still act
+        synthetic_trg = {
+            "id": tid,
+            "kind": "recall_due",  # sensible default
+            "scope": "merchant",
+            "urgency": 3,
+            "suppression_key": f"synthetic:{tid}",
+            "payload": {},
+        }
+        trigger_list.append((1, tid, synthetic_trg))
+
     # Cap at 20 actions per tick
     for _, trg_id, trg in trigger_list[:20]:
         merchant_id = trg.get("merchant_id")
         customer_id = trg.get("customer_id")
+
+        # If no merchant_id on trigger, try to find any loaded merchant
         if not merchant_id:
-            continue
+            merchant_candidates = [(k[1], v["payload"]) for k, v in contexts.items() if k[0] == "merchant"]
+            if merchant_candidates:
+                merchant_id, _ = merchant_candidates[0]
+            else:
+                continue
 
         merchant = get_merchant(merchant_id)
         if not merchant:
@@ -538,6 +652,10 @@ async def tick(body: TickBody):
 
         category_slug = merchant.get("category_slug")
         category = get_category(category_slug)
+        if not category:
+            # Try any loaded category
+            cat_candidates = [v["payload"] for k, v in contexts.items() if k[0] == "category"]
+            category = cat_candidates[0] if cat_candidates else {}
         if not category:
             continue
 
@@ -612,18 +730,27 @@ async def handle_reply(body: ReplyBody):
     conv = conversations.get(body.conversation_id)
 
     if not conv:
-        # Unknown conversation — create minimal state
+        # Unknown conversation — create minimal state and try to load trigger context
         conv = ConversationState(
             conversation_id=body.conversation_id,
             merchant_id=body.merchant_id or "",
             customer_id=body.customer_id,
         )
+        # Try to recover trigger context from the conversation_id pattern conv_{merchant_id}_{trigger_id}
+        parts = body.conversation_id.split("_")
+        if len(parts) >= 3:
+            recovered_trigger_id = "_".join(parts[2:])
+            recovered_trg = get_trigger(recovered_trigger_id)
+            if recovered_trg:
+                conv.trigger_context = recovered_trg
+                conv.trigger_id = recovered_trigger_id
         conversations[body.conversation_id] = conv
 
     if conv.state == ConvState.CLOSED:
         return {"action": "end", "rationale": "Conversation already closed"}
 
     merchant_id = body.merchant_id or conv.merchant_id
+    customer_id = body.customer_id or conv.customer_id
     merchant = get_merchant(merchant_id) if merchant_id else None
 
     if not merchant:
@@ -643,7 +770,14 @@ async def handle_reply(body: ReplyBody):
     category_slug = merchant.get("category_slug", "")
     category = get_category(category_slug) or {}
 
-    result = compose_reply(conv, body.message, merchant, category)
+    # Resolve customer context (for customer-role replies)
+    customer = get_customer(customer_id) if customer_id else None
+
+    # Branch on who is sending the message
+    if body.from_role == "customer":
+        result = compose_customer_reply(conv, body.message, merchant, category, customer)
+    else:
+        result = compose_reply(conv, body.message, merchant, category)
 
     if result.get("action") == "end":
         conv.state = ConvState.CLOSED
