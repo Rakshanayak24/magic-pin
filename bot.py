@@ -363,6 +363,8 @@ Output JSON only."""
 
 
 
+REPLY_SYSTEM = """You are Vera, magicpin's AI merchant assistant, mid-conversation.
+
 Your job: given the conversation so far + the merchant's latest reply, decide the next move.
 
 INTENT HANDLING:
