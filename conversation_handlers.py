@@ -179,10 +179,13 @@ def respond(state: ConversationState, merchant_message: str) -> dict:
 
     # ── Auto-reply branch ─────────────────────────────────────────────────────
     if is_auto:
-        state.auto_reply_count += 1
+        # NOTE: auto_reply_count is managed at MERCHANT level by bot.py (handle_reply)
+        # so it accumulates across different conversation IDs for the same merchant.
+        # We only increment here if it wasn't already incremented externally.
+        if not getattr(state, '_auto_incremented_this_turn', False):
+            state.auto_reply_count += 1
 
         if state.auto_reply_count >= 2:
-            # ── CRITICAL FIX: Exit after 2nd auto-reply detection (send + end) ──
             farewell = _get_farewell(state, "auto_reply")
             _record_vera(state, farewell)
             state.state = ConvState.CLOSED
@@ -193,7 +196,7 @@ def respond(state: ConversationState, merchant_message: str) -> dict:
                 "rationale": f"Auto-reply detected {state.auto_reply_count}× — exiting gracefully",
             }
 
-        # First auto-reply → ONE direct hook (not a generic send)
+        # First auto-reply → ONE direct hook
         hook = _compose_auto_reply_hook(state)
         _record_vera(state, hook)
         return {
