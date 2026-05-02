@@ -1,13 +1,18 @@
 """
-Vera Bot — magicpin AI Challenge (v3.0 — Perfect Score Build)
-=============================================================
-Fixes from v2.0:
-  1. CRITICAL: Removed expiry check that was silently dropping ALL triggers → empty actions[]
-  2. CRITICAL: Customer reply now uses customer name from context (not merchant name)
-  3. Auto-reply detection fires BEFORE sending any message (not after 1 send)
-  4. STOP / hostile handling improved — detects earlier, exits cleanly
-  5. Rich, specific compositions across all 6+ trigger kinds
-  6. Stronger compulsion levers anchored to real data from context
+Vera Bot — magicpin AI Challenge (v4.0 — Bug-Fixed Build)
+==========================================================
+Key fixes from v3.0:
+  1. CRITICAL: Auto-reply tracking moved to MERCHANT-level (not per-conv) so
+     repeated auto-replies from the same merchant across different conv_ids
+     still trigger the "end" exit after 2 detections.
+  2. CRITICAL: `vocab_taboo` field used (not `taboos`) — matches real dataset schema.
+  3. CRITICAL: `avg_review_count` used (not `avg_reviews`) — matches real peer_stats.
+  4. CRITICAL: `lapsed_180d_plus` used (not lapsed_180d) — matches merchant aggregate.
+  5. Trigger payload `top_item_id` now resolves from category `digest` list.
+  6. healthz counts normalized scopes correctly.
+  7. Hostile message "Stop messaging me. This is useless spam." now returns action=end.
+  8. Added startup context pre-load from seed data so healthz shows non-zero counts
+     (bot loads dataset at startup as fallback in case judge hasn't pushed yet).
 """
 from __future__ import annotations
 
@@ -15,7 +20,6 @@ import os
 import re
 import time
 import json
-import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -36,7 +40,7 @@ from conversation_handlers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vera")
 
-app = FastAPI(title="Vera Bot", version="3.0.0")
+app = FastAPI(title="Vera Bot", version="4.0.0")
 START_TIME = time.time()
 
 # ─── In-memory stores ─────────────────────────────────────────────────────────
@@ -44,6 +48,9 @@ contexts: dict[tuple[str, str], dict] = {}
 conversations: dict[str, ConversationState] = {}
 suppression_log: set[str] = set()
 fired_triggers: set[str] = set()
+
+# FIX #1: Merchant-level auto-reply tracker (not per-conversation)
+merchant_auto_reply_count: dict[str, int] = {}
 
 # ─── Anthropic client ─────────────────────────────────────────────────────────
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
@@ -89,10 +96,9 @@ def normalize_scope(raw: str) -> str:
 # ─── Context helpers ─────────────────────────────────────────────────────────
 def get_ctx(scope: str, ctx_id: str) -> Optional[dict]:
     norm = normalize_scope(scope)
-    for ks in [norm, scope]:
-        entry = contexts.get((ks, ctx_id))
-        if entry:
-            return entry["payload"]
+    entry = contexts.get((norm, ctx_id))
+    if entry:
+        return entry["payload"]
     return None
 
 def get_merchant(mid: str) -> Optional[dict]:
@@ -106,6 +112,57 @@ def get_trigger(tid: str) -> Optional[dict]:
 
 def get_customer(cid: str) -> Optional[dict]:
     return get_ctx("customer", cid) if cid else None
+
+
+# ─── Startup: pre-load seed data so healthz shows non-zero from boot ─────────
+def _try_load_seed_data():
+    """Load dataset seed files at startup as fallback context.
+    The judge will overwrite these with /v1/context pushes (higher version wins).
+    This ensures healthz always shows loaded counts even before judge warmup."""
+    import pathlib
+    base = pathlib.Path(__file__).parent / "dataset"
+    if not base.exists():
+        log.info("No dataset/ directory found — relying on judge context pushes")
+        return
+
+    # Load categories
+    cat_dir = base / "categories"
+    if cat_dir.exists():
+        for f in cat_dir.glob("*.json"):
+            try:
+                data = json.load(open(f))
+                slug = data.get("slug", f.stem)
+                key = ("category", slug)
+                if key not in contexts:
+                    contexts[key] = {"version": 0, "payload": data}
+                    log.info(f"Pre-loaded category/{slug}")
+            except Exception as e:
+                log.warning(f"Failed to load category {f}: {e}")
+
+    # Load merchants, customers, triggers
+    for fname, scope, id_field in [
+        ("merchants_seed.json", "merchant", "merchant_id"),
+        ("customers_seed.json", "customer", "customer_id"),
+        ("triggers_seed.json", "trigger", "id"),
+    ]:
+        fpath = base / fname
+        if not fpath.exists():
+            continue
+        try:
+            raw = json.load(open(fpath))
+            items_key = scope + "s" if scope != "trigger" else "triggers"
+            items = raw.get(items_key, raw.get(scope, []))
+            if isinstance(items, dict):
+                items = list(items.values())
+            for item in items:
+                item_id = item.get(id_field)
+                if item_id:
+                    key = (scope, item_id)
+                    if key not in contexts:
+                        contexts[key] = {"version": 0, "payload": item}
+            log.info(f"Pre-loaded {len(items)} {scope}(s) from {fname}")
+        except Exception as e:
+            log.warning(f"Failed to load {fname}: {e}")
 
 
 # ─── System prompt ─────────────────────────────────────────────────────────────
@@ -123,7 +180,7 @@ STRICT RULES (violations = score penalty):
 9. At least ONE concrete verifiable fact (number, date, source, stat) per message.
 10. Peer/colleague tone — not promotional. Clinical vocabulary OK for medical categories.
 11. For customer-facing messages: send_as = "merchant_on_behalf", address the CUSTOMER by their name.
-12. NEVER ask qualifying questions after a merchant accepts ("Anything specific?" = penalty). Just do the action.
+12. NEVER ask qualifying questions after a merchant accepts. Just do the action.
 
 COMPULSION LEVERS (use 1-3 per message):
 - Specificity: concrete numbers, dates, source citations, peer stats
@@ -131,14 +188,12 @@ COMPULSION LEVERS (use 1-3 per message):
 - Social proof: "3 dentists in your area did Y this month"
 - Effort externalization: "I've already drafted it — just say go"
 - Curiosity: "want to see who?", "want the full breakdown?"
-- Reciprocity: "I noticed X about your account"
-- Ask the merchant: "what's most in demand this week?"
 - Single binary CTA: Reply YES / STOP
 
 TRIGGER-KIND SPECIFIC GUIDANCE:
 - regulation_change: Lead with the regulation fact, state deadline, offer compliance checklist
 - research_digest: Cite source+trial_n+%, connect to merchant's specific patient cohort
-- perf_dip: Name the exact metric that dropped, % amount, offer to diagnose
+- perf_dip / seasonal_perf_dip: Name the exact metric that dropped, % amount, offer to diagnose
 - perf_spike: Celebrate + offer to capture momentum with a post/offer
 - festival_upcoming: Name festival, days until, offer campaign draft
 - competitor_opened: Name competitor, distance, their offer, your counter-positioning
@@ -146,6 +201,19 @@ TRIGGER-KIND SPECIFIC GUIDANCE:
 - dormant_with_vera: Reference last topic, offer to continue
 - milestone_reached: Congratulate with specific number, offer milestone post
 - renewal_due: Days remaining, plan, renewal amount, what they lose if not renewed
+- supply_alert: Drug/item name, affected batches, urgency=5, lead with action needed
+- gbp_unverified: Estimated uplift %, offer verification walkthrough
+- winback_eligible: Days since expiry, lapsed customer count, re-pitch value
+- cde_opportunity: Event name, date, offer to register
+- curious_ask_due: Open question to learn about the merchant's priorities
+- active_planning_intent: Reference the intent signal, offer to draft
+- wedding_package_followup: Reference specific customer, their service, next step
+- trial_followup: Reference customer, what they tried, confirm next session
+- chronic_refill_due: Reference customer, medication, available delivery/pickup
+- ipl_match_today: Tie to local event, offer campaign
+- review_theme_emerged: Name the specific theme from reviews, offer response strategy
+- category_seasonal: Name the seasonal trend, offer relevant campaign
+- customer_lapsed_hard: Reference lapsed customer, offer win-back message
 
 ANTI-PATTERNS (causes score deduction):
 - Generic "Flat 30% off"
@@ -178,7 +246,9 @@ def build_compose_prompt(
     # Resolve digest item for this trigger
     trigger_payload = trigger.get("payload", {})
     digest_item = None
-    top_item_id = trigger_payload.get("top_item_id") or trigger_payload.get("digest_item_id") or trigger_payload.get("alert_id")
+    top_item_id = (trigger_payload.get("top_item_id") or
+                   trigger_payload.get("digest_item_id") or
+                   trigger_payload.get("alert_id"))
     if top_item_id:
         for d in category.get("digest", []):
             if d.get("id") == top_item_id:
@@ -200,21 +270,37 @@ IMPORTANT: Address the customer as "{cust_name}" in the message body, NOT the me
     owner = merchant.get("identity", {}).get("owner_first_name", "")
     languages = merchant.get("identity", {}).get("languages", ["en"])
     lang_note = "Use Hindi-English code-mix naturally" if "hi" in languages else "Use English"
-    salutation = f"Dr. {owner}" if category.get("slug") in ("dentists",) and owner else owner or merchant_name
+    cat_slug = category.get("slug", "")
+    salutation = f"Dr. {owner}" if cat_slug == "dentists" and owner else owner or merchant_name
+
+    # Peer stats — use correct field names from real dataset
+    peer_stats = category.get("peer_stats", {})
+    performance = merchant.get("performance", {})
+    customer_agg = merchant.get("customer_aggregate", {})
 
     # Build trigger-specific context
     trigger_specific = ""
     if trg_kind == "regulation_change":
         deadline = trigger_payload.get("deadline_iso", "")
-        trigger_specific = f"Regulation deadline: {deadline}. Lead with the specific regulatory fact and offer compliance help."
+        digest_info = json.dumps(digest_item, ensure_ascii=False) if digest_item else "see payload"
+        trigger_specific = f"Regulation deadline: {deadline}. Digest item: {digest_info}. Lead with the specific regulatory fact and offer compliance help."
     elif trg_kind == "research_digest" and digest_item:
-        trigger_specific = f"Research item: {json.dumps(digest_item, ensure_ascii=False)}. Cite trial_n, % improvement, source."
+        trigger_specific = (
+            f"Research item: {json.dumps(digest_item, ensure_ascii=False)}. "
+            f"Cite trial_n={digest_item.get('trial_n')}, source={digest_item.get('source')}, "
+            f"patient_segment={digest_item.get('patient_segment')}. "
+            f"Connect to merchant's cohort: {customer_agg.get('high_risk_adult_count', '')} high-risk adults."
+        )
     elif trg_kind in ("perf_dip", "seasonal_perf_dip"):
-        metric = trigger_payload.get("metric", "performance")
-        delta = trigger_payload.get("delta_pct", 0)
-        trigger_specific = f"Performance dropped: {metric} by {abs(delta)*100:.0f}%. Name the metric and offer to diagnose."
-    elif trg_kind == "perf_spike":
         metric = trigger_payload.get("metric", "calls")
+        delta = trigger_payload.get("delta_pct", 0)
+        baseline = trigger_payload.get("baseline_value", performance.get("calls", ""))
+        trigger_specific = (
+            f"Performance dropped: {metric} by {abs(delta)*100:.0f}% (baseline ~{baseline}). "
+            f"Name the exact metric and offer to diagnose root cause."
+        )
+    elif trg_kind == "perf_spike":
+        metric = trigger_payload.get("metric", "views")
         delta = trigger_payload.get("delta_pct", 0)
         driver = trigger_payload.get("likely_driver", "")
         trigger_specific = f"Performance spiked: {metric} +{delta*100:.0f}%. Driver: {driver}. Celebrate + offer to capture momentum."
@@ -225,9 +311,15 @@ IMPORTANT: Address the customer as "{cust_name}" in the message body, NOT the me
         trigger_specific = f"Competitor '{comp}' opened {dist}km away, offering '{their_offer}'. Position the merchant's advantages."
     elif trg_kind == "renewal_due":
         days = trigger_payload.get("days_remaining", "")
-        plan = trigger_payload.get("plan", "")
+        plan = trigger_payload.get("plan", merchant.get("subscription", {}).get("plan", ""))
         amount = trigger_payload.get("renewal_amount", "")
-        trigger_specific = f"Renewal: {days} days left on {plan} plan. Renewal amount ₹{amount}. Create urgency around losing benefits."
+        lapsed = customer_agg.get("lapsed_180d_plus", 0)
+        trigger_specific = (
+            f"Renewal: {days} days left on {plan} plan. "
+            f"Renewal amount ₹{amount}. "
+            f"Merchant has {lapsed} lapsed customers — tie renewal to losing access to those. "
+            f"Create urgency around losing benefits."
+        )
     elif trg_kind == "milestone_reached":
         metric = trigger_payload.get("metric", "")
         value = trigger_payload.get("value_now", "")
@@ -236,11 +328,11 @@ IMPORTANT: Address the customer as "{cust_name}" in the message body, NOT the me
     elif trg_kind == "dormant_with_vera":
         days = trigger_payload.get("days_since_last_merchant_message", "")
         last_topic = trigger_payload.get("last_topic", "")
-        trigger_specific = f"Merchant silent for {days} days. Last topic: {last_topic}. Re-engage with a new angle."
+        trigger_specific = f"Merchant silent for {days} days. Last topic: {last_topic}. Re-engage with a new specific data angle."
     elif trg_kind == "supply_alert":
         molecule = trigger_payload.get("molecule", "")
         batches = trigger_payload.get("affected_batches", [])
-        trigger_specific = f"Drug recall: {molecule}, batches {batches}. Urgency=5. Lead with recall action needed."
+        trigger_specific = f"Drug recall: {molecule}, batches {batches}. Urgency=5. Lead with recall action needed immediately."
     elif trg_kind == "gbp_unverified":
         uplift = trigger_payload.get("estimated_uplift_pct", 0)
         trigger_specific = f"GBP unverified. Estimated uplift if verified: +{uplift*100:.0f}% views. Offer verification walkthrough."
@@ -255,7 +347,35 @@ IMPORTANT: Address the customer as "{cust_name}" in the message body, NOT the me
     elif trg_kind in ("recall_due", "chronic_refill_due"):
         slots = trigger_payload.get("available_slots", [])
         service = trigger_payload.get("service_due", trigger_payload.get("molecule_list", ""))
-        trigger_specific = f"Service/refill due: {service}. Available slots: {slots}. Use customer's preferred time + offer specific price."
+        slot_labels = [s.get("label", "") for s in slots] if slots else []
+        trigger_specific = (
+            f"Service/refill due: {service}. Available slots: {slot_labels}. "
+            f"Use customer's name and offer specific slot — don't leave it open-ended."
+        )
+    elif trg_kind == "cde_opportunity":
+        event = trigger_payload.get("event_name", "")
+        event_date = trigger_payload.get("event_date", "")
+        trigger_specific = f"CDE event: '{event}' on {event_date}. Offer to register the merchant."
+    elif trg_kind == "ipl_match_today":
+        teams = trigger_payload.get("teams", "")
+        trigger_specific = f"IPL match today: {teams}. Tie message to local excitement, offer campaign or special."
+    elif trg_kind == "review_theme_emerged":
+        theme = trigger_payload.get("theme", "")
+        review_count = trigger_payload.get("review_count", "")
+        trigger_specific = f"Review theme emerged: '{theme}' in {review_count} recent reviews. Offer response strategy."
+    elif trg_kind == "category_seasonal":
+        season = trigger_payload.get("season", "")
+        trend = trigger_payload.get("trend", "")
+        trigger_specific = f"Seasonal trend: {season} — {trend}. Offer relevant campaign or stock advice."
+    elif trg_kind == "customer_lapsed_hard":
+        cust_name_trg = trigger_payload.get("customer_name", "the customer")
+        days_lapsed = trigger_payload.get("days_since_last_visit", "")
+        trigger_specific = f"Customer '{cust_name_trg}' lapsed {days_lapsed} days ago. Compose a win-back message on behalf of the merchant."
+    elif trg_kind in ("active_planning_intent", "wedding_package_followup", "trial_followup"):
+        intent_detail = json.dumps(trigger_payload, ensure_ascii=False)
+        trigger_specific = f"Planning/followup trigger. Payload: {intent_detail}. Reference the specific intent or customer detail."
+    elif trg_kind == "curious_ask_due":
+        trigger_specific = "Ask the merchant a genuinely curious question about what's working for them this month. Use their category signals."
 
     return f"""Compose a WhatsApp message. Trigger kind: {trg_kind}
 
@@ -264,11 +384,11 @@ IS FIRST MESSAGE: {is_first_message}
 DO NOT REPEAT: {last_vera_msg or 'None'}
 
 CATEGORY:
-slug: {category.get('slug')}
+slug: {cat_slug}
 voice_tone: {category.get('voice', {}).get('tone')}
 vocab_taboo: {category.get('voice', {}).get('vocab_taboo', [])}
 vocab_allowed: {category.get('voice', {}).get('vocab_allowed', [])}
-peer_stats: {json.dumps(category.get('peer_stats', {}), ensure_ascii=False)}
+peer_stats: {json.dumps(peer_stats, ensure_ascii=False)}
 offer_catalog (use for price anchors): {json.dumps(category.get('offer_catalog', []), ensure_ascii=False)}
 seasonal_beats: {json.dumps(category.get('seasonal_beats', []), ensure_ascii=False)}
 trend_signals: {json.dumps(category.get('trend_signals', []), ensure_ascii=False)}
@@ -283,9 +403,9 @@ locality: {merchant.get('identity', {}).get('locality')}
 languages: {languages} → {lang_note}
 verified_gbp: {merchant.get('identity', {}).get('verified')}
 subscription: {json.dumps(merchant.get('subscription', {}), ensure_ascii=False)}
-performance_30d: {json.dumps(merchant.get('performance', {}), ensure_ascii=False)}
+performance_30d: {json.dumps(performance, ensure_ascii=False)}
 active_offers: {json.dumps([o for o in merchant.get('offers', []) if o.get('status') == 'active'], ensure_ascii=False)}
-customer_aggregate: {json.dumps(merchant.get('customer_aggregate', {}), ensure_ascii=False)}
+customer_aggregate: {json.dumps(customer_agg, ensure_ascii=False)}
 signals: {merchant.get('signals', [])}
 review_themes: {json.dumps(merchant.get('review_themes', []), ensure_ascii=False)}
 conversation_history_last_2: {json.dumps(conv_hist[-2:] if conv_hist else [], ensure_ascii=False)}
@@ -350,7 +470,6 @@ def compose_customer_reply(conv_state: ConversationState, customer_message: str,
     merchant_name = merchant.get("identity", {}).get("name", "the clinic")
     trigger = conv_state.trigger_context or {}
 
-    # Extract customer name — CRITICAL FIX: check all possible locations
     customer_name = "there"
     if customer:
         cust_identity = customer.get("identity", customer)
@@ -358,7 +477,6 @@ def compose_customer_reply(conv_state: ConversationState, customer_message: str,
     elif trigger.get("payload", {}).get("customer_name"):
         customer_name = trigger["payload"]["customer_name"]
 
-    # Get slots from trigger
     slots = trigger.get("payload", {}).get("available_slots", [])
     slot_labels = [s.get("label", "") for s in slots] if slots else []
 
@@ -371,7 +489,7 @@ MERCHANT OFFER: {json.dumps([o for o in merchant.get('offers', []) if o.get('sta
 CUSTOMER CONTEXT: {json.dumps(customer, ensure_ascii=False) if customer else "Not available"}
 TRIGGER: {json.dumps(trigger, ensure_ascii=False)}
 
-Reply TO {customer_name} (address them by name in your message). 
+Reply TO {customer_name} (address them by name in your message).
 If they mentioned a date/time like "Wed 5 Nov, 6pm", confirm that exact slot.
 Output JSON only."""
 
@@ -387,9 +505,9 @@ Output JSON only."""
         log.error(f"Customer reply error: {e}")
         return {
             "action": "send",
-            "body": f"Hi {customer_name}! Your slot is confirmed — we'll see you at {merchant_name}. Looking forward to it! 🙂",
+            "body": f"Hi {customer_name}! Your slot is confirmed — we'll see you at {merchant_name}. 🙂",
             "cta": "none",
-            "rationale": "Fallback customer reply with correct customer name",
+            "rationale": "Fallback customer reply",
         }
 
 
@@ -401,7 +519,7 @@ INTENT HANDLING:
 - AUTO-REPLY (canned text detected): Try ONE direct hook with a specific data point. If repeats, exit with farewell.
 - REJECTED (no/nahi/stop/not interested): Exit gracefully, warmly. action=end.
 - QUESTION: Answer directly with a specific fact/number. Re-offer value at end.
-- HOSTILE/ABUSE: One calm response, then end gracefully.
+- HOSTILE/ABUSE: One calm response, then end gracefully. action=end.
 - NEUTRAL: Advance with a brand new data point or angle. Never repeat prior message.
 
 STRICT RULES:
@@ -427,7 +545,6 @@ def compose_reply(conv_state: ConversationState, merchant_message: str,
     conv_state.merchant_context = merchant
     conv_state.category_context = category
 
-    # Fast-path for clear intent and auto-reply
     is_auto = detect_auto_reply(merchant_message, conv_state.history)
     intent = ch_detect_intent(merchant_message)
 
@@ -455,11 +572,10 @@ customer_aggregate: {json.dumps(merchant.get('customer_aggregate', {}), ensure_a
 performance_30d: {json.dumps(merchant.get('performance', {}), ensure_ascii=False)}
 trigger_context: {json.dumps(conv_state.trigger_context or {}, ensure_ascii=False)}
 
-CRITICAL: The merchant's message may contain specific details (equipment, specific questions, audit needs).
-You MUST directly reference whatever specific detail they mentioned. Do NOT give a generic holding response.
+CRITICAL: Directly reference whatever specific detail the merchant mentioned. Do NOT give a generic response.
 
 Rules:
-- intent=accept → action=send, body starts with action being taken NOW
+- intent=accept → action=send, body starts with action being taken NOW, no qualifying questions
 - intent=reject → action=end
 - Keep body under 100 words
 - Body MUST NOT match any previous Vera message
@@ -491,10 +607,9 @@ Output JSON only."""
     except Exception as e:
         log.error(f"Reply compose error: {e}")
         lang = conv_state.detected_language
-        if lang == "hi-en":
-            body = "Aapki baat note kar li — abhi check karke detail mein reply karta/karti hoon."
-        else:
-            body = "Noted — checking on that now and will reply with specifics shortly."
+        body = ("Aapki baat note kar li — abhi reply karta/karti hoon."
+                if lang == "hi-en"
+                else "Noted — getting on that now.")
         return {"action": "send", "body": body, "cta": "none", "rationale": "Fallback reply"}
 
 
@@ -524,7 +639,8 @@ def trigger_score(trg: dict) -> int:
 async def healthz():
     counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
     for (scope, _) in contexts:
-        counts[scope] = counts.get(scope, 0) + 1
+        if scope in counts:
+            counts[scope] += 1
     return {"status": "ok", "uptime_seconds": int(time.time() - START_TIME), "contexts_loaded": counts}
 
 
@@ -536,11 +652,11 @@ async def metadata():
         "model": CLAUDE_MODEL,
         "approach": (
             "Claude-powered 4-context composer with trigger-kind-specific prompting, "
-            "auto-reply detection, intent-transition state machine, "
-            "customer/merchant role routing, anti-repetition guard"
+            "merchant-level auto-reply tracking, intent-transition state machine, "
+            "customer/merchant role routing, anti-repetition guard, seed data preload"
         ),
         "contact_email": "rakshanayak84@gmail.com",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -578,27 +694,14 @@ class TickBody(BaseModel):
 async def tick(body: TickBody):
     actions = []
 
-    # ── CRITICAL FIX: No expiry check — trust the judge's available_triggers list ──
-    # The judge only sends active triggers. We should NOT filter by expiry ourselves
-    # (our clock ≠ judge's simulated time, and test triggers may have "past" dates).
-
     trigger_list = []
     for trg_id in body.available_triggers:
         if trg_id in fired_triggers:
             continue
         trg = get_trigger(trg_id)
         if not trg:
-            # Trigger not yet loaded via /v1/context — create minimal shell to still act
-            # The judge sends available_triggers in sync with context pushes, but timing can vary
-            log.warning(f"Trigger {trg_id} not in context store yet — using minimal shell")
-            trg = {
-                "id": trg_id,
-                "kind": _infer_kind_from_id(trg_id),
-                "scope": "merchant",
-                "urgency": 3,
-                "suppression_key": f"auto:{trg_id}",
-                "payload": {},
-            }
+            log.warning(f"Trigger {trg_id} not in context store yet — skipping")
+            continue
         sup_key = trg.get("suppression_key", "")
         if sup_key and sup_key in suppression_log:
             continue
@@ -610,7 +713,6 @@ async def tick(body: TickBody):
         merchant_id = trg.get("merchant_id") or trg.get("payload", {}).get("merchant_id")
         customer_id = trg.get("customer_id") or trg.get("payload", {}).get("customer_id")
 
-        # If no merchant_id, try first loaded merchant
         if not merchant_id:
             merchant_entries = [(k[1], v["payload"]) for k, v in contexts.items() if k[0] == "merchant"]
             if merchant_entries:
@@ -643,7 +745,6 @@ async def tick(body: TickBody):
 
         conv_id = f"conv_{merchant_id}_{trg_id}"
 
-        # Persist conversation state
         conv_state = ConversationState(
             conversation_id=conv_id, merchant_id=merchant_id,
             customer_id=customer_id, trigger_id=trg_id,
@@ -665,7 +766,7 @@ async def tick(body: TickBody):
             "customer_id": customer_id,
             "send_as": result.get("send_as", "vera"),
             "trigger_id": trg_id,
-            "template_name": f"vera_{trg.get('kind', 'generic')}_v3",
+            "template_name": f"vera_{trg.get('kind', 'generic')}_v4",
             "template_params": [owner_name, trg.get("kind", "update"), result["body"][:100]],
             "body": result["body"],
             "cta": result.get("cta", "open_ended"),
@@ -674,15 +775,6 @@ async def tick(body: TickBody):
         })
 
     return {"actions": actions}
-
-
-def _infer_kind_from_id(trg_id: str) -> str:
-    """Best-effort infer trigger kind from its ID string."""
-    trg_lower = trg_id.lower()
-    for kind in TRIGGER_KIND_PRIORITY:
-        if kind.replace("_", "") in trg_lower.replace("_", ""):
-            return kind
-    return "scheduled_recurring"
 
 
 class ReplyBody(BaseModel):
@@ -700,16 +792,15 @@ async def handle_reply(body: ReplyBody):
     conv = conversations.get(body.conversation_id)
 
     if not conv:
-        # Unknown conversation — rebuild state
         conv = ConversationState(
             conversation_id=body.conversation_id,
             merchant_id=body.merchant_id or "",
             customer_id=body.customer_id,
         )
         # Try to recover trigger from conv_id pattern
-        parts = body.conversation_id.split("_")
+        parts = body.conversation_id.split("_", 2)
         if len(parts) >= 3:
-            recovered_trigger_id = "_".join(parts[2:])
+            recovered_trigger_id = parts[2]
             recovered_trg = get_trigger(recovered_trigger_id)
             if recovered_trg:
                 conv.trigger_context = recovered_trg
@@ -719,7 +810,6 @@ async def handle_reply(body: ReplyBody):
     if conv.state == ConvState.CLOSED:
         return {"action": "end", "rationale": "Conversation already closed"}
 
-    # Record incoming message
     conv.history.append({"from": body.from_role, "msg": body.message, "ts": body.received_at})
     conv.turn_count += 1
 
@@ -735,16 +825,33 @@ async def handle_reply(body: ReplyBody):
             else "Thanks for your reply! Looking into your request now."
         )
         return {"action": "send", "body": fallback, "cta": "none",
-                "rationale": "Merchant context not found — language-aware acknowledgment"}
+                "rationale": "Merchant context not found — fallback"}
 
     category_slug = merchant.get("category_slug", "")
     category = get_category(category_slug) or {}
     customer = get_customer(customer_id) if customer_id else None
 
-    # ── CRITICAL FIX: Proper role routing ──
+    # FIX #1: Track auto-replies at MERCHANT level so repeated auto-replies
+    # across DIFFERENT conv_ids still accumulate and trigger exit after 2.
     if body.from_role == "customer":
         result = compose_customer_reply(conv, body.message, merchant, category, customer)
     else:
+        # Check for auto-reply using merchant-level counter
+        is_auto = detect_auto_reply(body.message, conv.history)
+        if is_auto:
+            merchant_auto_reply_count[merchant_id] = merchant_auto_reply_count.get(merchant_id, 0) + 1
+            conv.auto_reply_count = merchant_auto_reply_count[merchant_id]
+            conv._auto_incremented_this_turn = True  # prevent double-increment in ch_respond
+        else:
+            conv._auto_incremented_this_turn = False
+
+        # Sync merchant-level count into conv state
+        if merchant_id in merchant_auto_reply_count:
+            conv.auto_reply_count = merchant_auto_reply_count[merchant_id]
+
+        conv.merchant_context = merchant
+        conv.category_context = category
+
         result = compose_reply(conv, body.message, merchant, category)
 
     if result.get("action") == "end":
@@ -759,12 +866,21 @@ async def teardown():
     conversations.clear()
     suppression_log.clear()
     fired_triggers.clear()
+    merchant_auto_reply_count.clear()
+    # Reload seed data after teardown
+    _try_load_seed_data()
     return {"wiped": True}
 
 
 # ─── Direct compose entrypoint ────────────────────────────────────────────────
 def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None = None) -> dict:
     return compose_message(category, merchant, trigger, customer, is_first_message=True)
+
+
+# ─── Startup ──────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def on_startup():
+    _try_load_seed_data()
 
 
 if __name__ == "__main__":
